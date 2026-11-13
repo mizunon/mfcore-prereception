@@ -1,0 +1,4 @@
+# 検査の作業ファイル
+*.y4m
+node_modules/
+__pycache__/
