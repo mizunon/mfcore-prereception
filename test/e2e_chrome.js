@@ -214,8 +214,13 @@ async function main() {
     check(await cdp.evaluate(`document.getElementById('qrTitle').textContent.includes('4 名')`), '人数の表示');
     await cdp.screenshot(path.join(TMP, 'shot_3_batch_qr.png'));
     await cdp.evaluate(`document.getElementById('qrClose').click()`);
-    check(await cdp.evaluate(`document.getElementById('qrOverlay').hidden`), '閉じる');
-    check((await cdp.evaluate(MEMBERS_JS)).length === 4, 'まとめ QR を見せた後も一覧は消えない');
+    check(await cdp.evaluate(`!document.getElementById('dialog').hidden && document.getElementById('dialogText').textContent.includes('このグループを削除して閉じますか') && document.getElementById('dialogText').textContent.includes('4 名')`),
+      '「閉じる」で「このグループを削除して閉じますか？」が出る');
+    check(await cdp.evaluate(`document.getElementById('dialogOk').textContent === '削除して閉じる' && document.getElementById('dialogCancel').textContent === '残して閉じる'`), 'ボタンは「削除して閉じる」「残して閉じる」');
+    check(await cdp.evaluate(`!document.getElementById('qrOverlay').hidden`), '選ぶまではまとめ QR を出したまま');
+    await cdp.evaluate(`document.getElementById('dialogCancel').click()`);
+    check(await cdp.evaluate(`document.getElementById('qrOverlay').hidden && document.getElementById('dialog').hidden`), '「残して閉じる」で閉じる');
+    check((await cdp.evaluate(MEMBERS_JS)).length === 4, '「残して閉じる」なら一覧は消えない');
     check(await cdp.evaluate(`document.getElementById('groups').textContent.includes('表示済み')`), 'グループに「表示済み」の印');
 
     console.log('== 1 枚あたり 2 人にすると 2 枚に分かれて自動で切り替わる');
@@ -232,6 +237,7 @@ async function main() {
       '2 枚とも読み戻せて、2 人ずつ・同じグループ ID');
     await cdp.screenshot(path.join(TMP, 'shot_4_batch_part2.png'));
     await cdp.evaluate(`document.getElementById('qrClose').click()`);
+    await cdp.evaluate(`document.getElementById('dialogCancel').click()`);
     await cdp.evaluate(`(() => { const s = document.getElementById('setMax'); s.value = '4'; s.dispatchEvent(new Event('change')); })()`);
 
     console.log('== 新しいグループ');
@@ -259,6 +265,34 @@ async function main() {
     check(await cdp.evaluate(`document.getElementById('dialogText').textContent.includes('すべてのグループ')`), 'すべて消去も確認が出る');
     await cdp.evaluate(`document.getElementById('dialogOk').click()`);
     check((await cdp.evaluate(MEMBERS_JS)).length === 0 && await cdp.evaluate(`document.querySelectorAll('#groups button:not(.add)').length === 1`), 'すべて消去で空のグループ 1 つに');
+
+    console.log('== まとめ QR を閉じるときに「削除して閉じる」');
+    // 2 つのグループに会員を入れておく (保存の API で直接。読取は上で確かめた)
+    await cdp.evaluate(`(() => {
+      const s = PreReceptionStore.createStore(localStorage);
+      const sig = '8f1b9c4e2a7d3f6b5c8e1a9d2f4b6c8e';
+      s.addMember({ user_code: 'RCDR-26-K0001', username: 'keep1', issued_at: 0, sig });
+      s.newGroup();
+      s.addMember({ user_code: 'RCDR-26-H0001', username: 'handed1', issued_at: 0, sig });
+      s.addMember({ user_code: 'RCDR-26-H0002', username: 'handed2', issued_at: 0, sig });
+    })()`);
+    await cdp.send('Page.reload', { ignoreCache: true });
+    await sleep(1200);
+    check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === JSON.stringify(['handed1|RCDR-26-H0001', 'handed2|RCDR-26-H0002']), '渡すグループ (2 人) を選んでいる');
+    await cdp.evaluate(`document.getElementById('showBtn').click()`);
+    await sleep(300);
+    await cdp.evaluate(`document.getElementById('qrClose').click()`);
+    check(await cdp.evaluate(`document.getElementById('dialogText').textContent.includes('グループ 2 (2 名)')`), '確認にグループの名前と人数が出る');
+    await cdp.screenshot(path.join(TMP, 'shot_6_close_dialog.png'));
+    await cdp.evaluate(`document.getElementById('dialogOk').click()`);
+    check(await cdp.evaluate(`document.getElementById('qrOverlay').hidden && document.getElementById('dialog').hidden`), '「削除して閉じる」で閉じる');
+    check(await cdp.evaluate(`document.querySelectorAll('#groups button:not(.add)').length === 1`), '渡したグループだけ消える (グループが 1 つに)');
+    check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === JSON.stringify(['keep1|RCDR-26-K0001']), '残りのグループの会員はそのまま');
+    check(await cdp.evaluate(`document.getElementById('scanMsg').textContent.includes('グループ 2 を削除しました')`), '削除したことを知らせる');
+    await cdp.send('Page.reload', { ignoreCache: true });
+    await sleep(1200);
+    check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === JSON.stringify(['keep1|RCDR-26-K0001']), 'リロード後も同じ');
+    await cdp.screenshot(path.join(TMP, 'shot_7_after_close_delete.png'));
 
     console.log('== Service Worker / 画面のエラー');
     const sw = await cdp.evaluate(`navigator.serviceWorker.getRegistration().then(r => !!(r && (r.active || r.installing || r.waiting)))`);

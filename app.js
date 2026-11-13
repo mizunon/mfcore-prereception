@@ -50,6 +50,7 @@
   var wakeLock = null;
   var cameraWasOn = false;     // まとめ QR の表示 / 画面が隠れた間に止めたカメラを戻すか
   var dialogOnOk = null;
+  var dialogOnCancel = null;
 
   // ── 小物 ──
 
@@ -128,19 +129,30 @@
 
   // ── 確認ダイアログ (消去の操作は必ずここを通す) ──
 
-  function confirmDanger(text, okLabel, onOk) {
+  /**
+   * 消去の確認。赤いボタン (okLabel) を押したときだけ onOk を呼ぶ。
+   * もう一方のボタンは既定で「キャンセル」(何もしない)。cancelLabel / onCancel で文言と動きを変えられる。
+   */
+  function confirmDanger(text, okLabel, onOk, cancelLabel, onCancel) {
     el.dialogText.textContent = text;
     el.dialogOk.textContent = okLabel;
+    el.dialogCancel.textContent = cancelLabel || 'キャンセル';
     dialogOnOk = onOk;
+    dialogOnCancel = onCancel || null;
     el.dialog.hidden = false;
   }
 
   function closeDialog() {
     el.dialog.hidden = true;
     dialogOnOk = null;
+    dialogOnCancel = null;
   }
 
-  el.dialogCancel.addEventListener('click', closeDialog);
+  el.dialogCancel.addEventListener('click', function () {
+    var fn = dialogOnCancel;
+    closeDialog();
+    if (fn) fn();
+  });
   el.dialogOk.addEventListener('click', function () {
     var fn = dialogOnOk;
     closeDialog();
@@ -523,7 +535,11 @@
     cameraWasOn = scanning;
     stopCamera();
     store.markHanded(g.id);
-    qr = { parts: parts, slices: slices, index: 0, paused: false, title: groupLabel(g) + ' — ' + g.members.length + ' 名' };
+    qr = {
+      parts: parts, slices: slices, index: 0, paused: false,
+      title: groupLabel(g) + ' — ' + g.members.length + ' 名',
+      groupId: g.id, groupName: groupLabel(g), count: g.members.length
+    };
     el.qrOverlay.hidden = false;
     drawQr();
     if (parts.length > 1) {
@@ -547,8 +563,23 @@
     cameraWasOn = false;
   }
 
+  /**
+   * 「閉じる」: Host に渡し終えたグループをここで片付けられるように、削除するか残すかを聞く。
+   * 消すのは「削除して閉じる」を押したときだけ (「残して閉じる」は今までどおり一覧に残る)。
+   */
+  function askCloseQr() {
+    if (!qr) { closeQr(); return; }
+    var groupId = qr.groupId;
+    var groupName = qr.groupName;
+    confirmDanger('このグループを削除して閉じますか？\n' + groupName + ' (' + qr.count + ' 名)\n削除すると元に戻せません。', '削除して閉じる', function () {
+      var r = store.deleteGroup(groupId);
+      setMsg(r.ok ? '' : 'err', r.ok ? groupName + ' を削除しました' : '保存できませんでした — ' + groupName + ' は削除されていません');
+      closeQr();
+    }, '残して閉じる', closeQr);
+  }
+
   el.showBtn.addEventListener('click', openQr);
-  el.qrClose.addEventListener('click', closeQr);
+  el.qrClose.addEventListener('click', askCloseQr);
   el.qrCanvas.addEventListener('click', function () {
     if (!qr || qr.parts.length <= 1) return;
     qr.paused = !qr.paused;
