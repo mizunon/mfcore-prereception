@@ -1,23 +1,31 @@
 /*
  * 通しの検査 (PC の Chrome、スマホ不要): 偽カメラに会員 QR の映像を流し、
  *   カメラ読取 → 一覧 → リロードしても残る → まとめ QR の表示 (画面の QR を読み戻して照合) → 消去
- * を実際のページで確かめる。
+ * を実際のページで確かめる。続けて、版を上げたときの切り替え (設定の「最新版に更新」/ 開いた直後の自動切り替え /
+ * 作業中の「新しい版があります」) も確かめる。
  *
- *   1. 別の端末で:  python -m http.server 8765 --bind 127.0.0.1   (このリポジトリの直下で)
- *   2. node test/e2e_chrome.js
+ *   node test/e2e_chrome.js
  *
- * 環境変数: CHROME (chrome.exe のパス) / E2E_URL (既定 http://127.0.0.1:8765/) / E2E_TMP (作業フォルダ) / E2E_PORT (既定 9333)
+ * サイトの写しを作業フォルダに作り、このスクリプト自身が配信する (公開先と同じ Cache-Control: max-age=600 を返す)。
+ * 版の切り替えの検査では、その写しの version.js / sw.js を書き換える (リポジトリのファイルは変えない)。
+ *
+ * 環境変数: CHROME (chrome.exe のパス) / E2E_TMP (作業フォルダ) / E2E_PORT (Chrome の操作用、既定 9333) /
+ *   E2E_HTTP_PORT (配信用、既定 8766) / E2E_URL (公開先などを直接検査する。この場合、版の切り替えの検査は省く)
  * Node 22 以上 (組み込みの WebSocket / fetch を使う)。失敗が 1 件でもあれば終了コード 1。
  */
 'use strict';
 const fs = require('fs');
+const http = require('http');
 const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const qrcode = require(path.join(__dirname, '..', 'vendor', 'qrcode.js'));
 const Codec = require(path.join(__dirname, '..', 'codec.js'));
 
-const URL_BASE = process.env.E2E_URL || 'http://127.0.0.1:8765/';
+const ROOT = path.join(__dirname, '..');
+const EXTERNAL_URL = process.env.E2E_URL || '';
+const HTTP_PORT = parseInt(process.env.E2E_HTTP_PORT || '8766', 10);
+const URL_BASE = EXTERNAL_URL || `http://127.0.0.1:${HTTP_PORT}/`;
 const PORT = parseInt(process.env.E2E_PORT || '9333', 10);
 const TMP = process.env.E2E_TMP || fs.mkdtempSync(path.join(os.tmpdir(), 'prereception-e2e-'));
 const CHROME = process.env.CHROME || [
@@ -123,9 +131,83 @@ async function connect() {
 
 const MEMBERS_JS = `Array.from(document.querySelectorAll('#members li')).map(li => li.querySelector('.name').textContent + '|' + li.querySelector('.code').textContent.split(' ')[0])`;
 
+// ── サイトの写しと配信 ──
+
+const SITE_ITEMS = ['index.html', 'app.css', 'app.js', 'codec.js', 'store.js', 'sw.js', 'version.js', 'manifest.webmanifest', 'vendor', 'icons'];
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png', '.webmanifest': 'application/manifest+json', '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8',
+};
+
+function copySite(dst) {
+  fs.rmSync(dst, { recursive: true, force: true });
+  fs.mkdirSync(dst, { recursive: true });
+  for (const item of SITE_ITEMS) fs.cpSync(path.join(ROOT, item), path.join(dst, item), { recursive: true });
+}
+
+/** 公開先 (GitHub Pages) と同じく max-age=600 と ETag を返す静的サーバー。 */
+function startServer(dir, port) {
+  const server = http.createServer((req, res) => {
+    // server.down = true の間は接続を切る (回線なしの再現。Chrome の「オフライン」の模擬はページの通信にしか効かず、
+    // Service Worker の更新確認の通信には効かないので、サーバー側でも止める)
+    if (server.down) { req.socket.destroy(); return; }
+    let rel = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+    if (rel.endsWith('/')) rel += 'index.html';
+    const file = path.join(dir, rel);
+    if (!file.startsWith(dir) || !fs.existsSync(file) || !fs.statSync(file).isFile()) { res.writeHead(404); res.end('not found'); return; }
+    const st = fs.statSync(file);
+    const etag = `"${st.size}-${Math.round(st.mtimeMs)}"`;
+    const headers = { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream', 'Cache-Control': 'max-age=600', ETag: etag };
+    if (req.headers['if-none-match'] === etag) { res.writeHead(304, headers); res.end(); return; }
+    res.writeHead(200, headers);
+    res.end(fs.readFileSync(file));
+  });
+  return new Promise((resolve, reject) => { server.on('error', reject); server.listen(port, '127.0.0.1', () => resolve(server)); });
+}
+
+function siteVersion(dir) {
+  return /APP_VERSION\s*=\s*'([^']+)'/.exec(fs.readFileSync(path.join(dir, 'version.js'), 'utf8'))[1];
+}
+
+/** 写しの版を上げる (version.js と sw.js の両方 = 実際の公開と同じ)。 */
+function setSiteVersion(dir, to) {
+  const from = siteVersion(dir);
+  for (const f of ['version.js', 'sw.js']) {
+    const p = path.join(dir, f);
+    fs.writeFileSync(p, fs.readFileSync(p, 'utf8').split(`'${from}'`).join(`'${to}'`));
+  }
+}
+
+/** 画面の版表示が v<version> になるまで待つ (読み込み直しの間は評価に失敗するので握る)。 */
+async function waitVersion(cdp, version, ms) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    try {
+      if (await cdp.evaluate(`document.getElementById('ver') ? document.getElementById('ver').textContent : ''`) === 'v' + version) return true;
+    } catch (e) { /* 読み込み直しの途中 */ }
+    await sleep(300);
+  }
+  return false;
+}
+
+async function waitFor(cdp, expr, ms) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    try { if (await cdp.evaluate(expr)) return true; } catch (e) { /* 読み込み直しの途中 */ }
+    await sleep(300);
+  }
+  return false;
+}
+
 async function main() {
   if (!CHROME) throw new Error('Chrome が見つかりません (環境変数 CHROME にパスを指定)');
   fs.mkdirSync(TMP, { recursive: true });
+  const siteDir = path.join(TMP, 'site');
+  let server = null;
+  if (!EXTERNAL_URL) {
+    copySite(siteDir);
+    server = await startServer(siteDir, HTTP_PORT);
+  }
   const y4m = path.join(TMP, 'member_qr.y4m');
   writeY4m(y4m);
   // プロフィールのパスは短く (Windows: 長いと Service Worker のキャッシュのファイル名が 260 文字を超え、
@@ -294,21 +376,80 @@ async function main() {
     check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === JSON.stringify(['keep1|RCDR-26-K0001']), 'リロード後も同じ');
     await cdp.screenshot(path.join(TMP, 'shot_7_after_close_delete.png'));
 
-    console.log('== Service Worker / 画面のエラー');
+    console.log('== Service Worker / 回線なし');
     const sw = await cdp.evaluate(`navigator.serviceWorker.getRegistration().then(r => !!(r && (r.active || r.installing || r.waiting)))`);
     check(sw, 'Service Worker が登録されている');
     const cached = await cdp.evaluate(`caches.keys().then(async ks => { const k = ks.find(x => x.startsWith('prereception-')); if (!k) return -1; return (await (await caches.open(k)).keys()).length; })`);
     check(cached >= 13, 'アプリ一式がキャッシュに入っている (' + cached + ' 件)');
+    check(cdp.consoleErrors.length === 0, 'ここまで画面のエラーなし' + (cdp.consoleErrors.length ? ': ' + cdp.consoleErrors.join(' / ') : ''));
     await cdp.send('Network.enable');
+    if (server) server.down = true;
     await cdp.send('Network.emulateNetworkConditions', { offline: true, latency: 0, downloadThroughput: 0, uploadThroughput: 0 });
     await cdp.send('Page.reload', {});
     await sleep(1500);
     check(await cdp.evaluate(`!!document.getElementById('camBtn') && document.getElementById('ver').textContent.startsWith('v')`), '回線なしでも開ける');
+    check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === JSON.stringify(['keep1|RCDR-26-K0001']), '回線なしでも一覧が出る');
+    if (server) {
+      await cdp.evaluate(`document.getElementById('settings').open = true`);
+      await cdp.evaluate(`document.getElementById('updateBtn').click()`);
+      const said = await waitFor(cdp, `document.getElementById('updateInfo').textContent.includes('確認できませんでした')`, 15000);
+      check(said, '回線なしで「最新版に更新」を押すと「確認できませんでした」: ' + await cdp.evaluate(`document.getElementById('updateInfo').textContent`));
+      check(await cdp.evaluate(`!!document.getElementById('camBtn')`) && JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === JSON.stringify(['keep1|RCDR-26-K0001']), '確認に失敗しても今の版のまま使える');
+      server.down = false;
+    }
     await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    cdp.consoleErrors.length = 0;   // 回線なしの間の「読み込めません」は想定どおり
+
+    if (!EXTERNAL_URL) {
+      const KEEP = JSON.stringify(['keep1|RCDR-26-K0001']);
+      const cachesJs = `caches.keys().then(ks => ks.filter(k => k.startsWith('prereception-')).sort().join(','))`;
+      const clearGuard = `sessionStorage.removeItem('prereception.applyAt')`;   // 「直前に切り替えた」の 30 秒の歯止めを外す
+
+      console.log('== 版を上げる: 設定の「最新版に更新」');
+      await cdp.send('Page.reload', {});
+      await sleep(1500);
+      const v0 = siteVersion(siteDir);
+      check(await waitVersion(cdp, v0, 5000), '今の版 v' + v0 + ' で開いている');
+      await cdp.evaluate(`document.getElementById('settings').open = true`);
+      await cdp.evaluate(`document.getElementById('updateBtn').click()`);
+      check(await waitFor(cdp, `document.getElementById('updateInfo').textContent.includes('最新の版です')`, 8000), '新しい版が無ければ「最新の版です」');
+      setSiteVersion(siteDir, '9.9.1');
+      await cdp.evaluate(`document.getElementById('updateBtn').click()`);
+      check(await waitVersion(cdp, '9.9.1', 25000), '版を上げて「最新版に更新」→ 聞かずに v9.9.1 に切り替わる (配信は max-age=600 のまま)');
+      await sleep(800);
+      check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === KEEP, '切り替えても一覧は残る');
+      check(await cdp.evaluate(cachesJs) === 'prereception-9.9.1', '古い版のキャッシュは消えている: ' + await cdp.evaluate(cachesJs));
+
+      console.log('== 版を上げる: 開いた直後 (未操作) は自動で切り替わる');
+      await cdp.evaluate(clearGuard);
+      setSiteVersion(siteDir, '9.9.2');
+      await cdp.send('Page.navigate', { url: 'about:blank' });
+      await sleep(300);
+      await cdp.send('Page.navigate', { url: URL_BASE + 'index.html' });
+      check(await waitVersion(cdp, '9.9.2', 25000), '開き直すだけで v9.9.2 に切り替わる');
+      await sleep(800);
+      check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === KEEP, '自動で切り替わっても一覧は残る');
+
+      console.log('== 版を上げる: 作業中は「新しい版があります」を出して待つ');
+      await cdp.evaluate(clearGuard);
+      await cdp.evaluate(`document.dispatchEvent(new Event('pointerdown'))`);   // 画面に触れた = 作業中
+      setSiteVersion(siteDir, '9.9.3');
+      await cdp.evaluate(`navigator.serviceWorker.getRegistration().then(r => r.update()).then(() => true)`);
+      check(await waitFor(cdp, `!!document.querySelector('.banner.info button')`, 20000), '「新しい版があります」が出る');
+      check(await cdp.evaluate(`document.getElementById('ver').textContent`) === 'v9.9.2', '作業中は勝手に切り替えない (v9.9.2 のまま)');
+      await cdp.screenshot(path.join(TMP, 'shot_8_update_banner.png'));
+      await cdp.evaluate(`document.querySelector('.banner.info button').click()`);
+      check(await waitVersion(cdp, '9.9.3', 15000), '「更新する」で v9.9.3 に切り替わる');
+      await sleep(800);
+      check(JSON.stringify(await cdp.evaluate(MEMBERS_JS)) === KEEP, '切り替えても一覧は残る (3 回目)');
+      check(await cdp.evaluate(cachesJs) === 'prereception-9.9.3', 'キャッシュは最新の版だけ');
+    }
+
     check(cdp.consoleErrors.length === 0, '画面のエラーなし' + (cdp.consoleErrors.length ? ': ' + cdp.consoleErrors.join(' / ') : ''));
   } finally {
     if (cdp) cdp.close();
     chrome.kill();
+    if (server) server.close();
   }
 
   console.log(`\npass=${pass} fail=${failures.length}  (スクリーンショット: ${TMP})`);

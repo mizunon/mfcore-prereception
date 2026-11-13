@@ -44,6 +44,22 @@ for (const [label, members, max] of [
 const typical = makeQr(Codec.encodeGroup(nine.slice(0, 4), 4)[0]);
 check(typical && typical.qr.getModuleCount() <= 57, '英数字の名前 4 人は 57 マス角以内');
 
+// 版: version.js と sw.js は同じ値 (ブラウザは sw.js のバイト列の変化で更新を見つけるので、sw.js にも版を書いている)
+const fs = require('fs');
+const root = path.join(__dirname, '..');
+const pageVersion = (/APP_VERSION\s*=\s*'([^']+)'/.exec(fs.readFileSync(path.join(root, 'version.js'), 'utf8')) || [])[1];
+const swText = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
+const swVersion = (/var VERSION\s*=\s*'([^']+)'/.exec(swText) || [])[1];
+check(!!pageVersion && pageVersion === swVersion, `version.js (${pageVersion}) と sw.js (${swVersion}) の版が同じ`);
+check(!/importScripts\s*\(/.test(swText.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')), 'sw.js は importScripts を使わない (版を別ファイルに置くと更新が見つからない)');
+
+// Service Worker がキャッシュするファイルが実在し、index.html が読むファイルはすべてキャッシュに入っている
+const assets = (/var ASSETS = \[([\s\S]*?)\];/.exec(swText) || [, ''])[1].match(/'([^']+)'/g).map(s => s.slice(1, -1));
+for (const a of assets) if (a !== './') check(fs.existsSync(path.join(root, a)), 'キャッシュするファイルがある: ' + a);
+const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+const referenced = Array.from(html.matchAll(/(?:src|href)="([^"]+)"/g)).map(m => m[1]);
+for (const r of referenced) check(assets.includes(r), 'index.html が読むファイルはキャッシュに入れる: ' + r);
+
 console.log(sizes.join('\n'));
 console.log(`pass=${pass} fail=${failures.length}`);
 for (const f of failures) console.log('  FAIL ' + f);

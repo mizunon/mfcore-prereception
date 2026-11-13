@@ -29,6 +29,7 @@
     groupTitle: $('groupTitle'), memo: $('memo'), members: $('members'), emptyHint: $('emptyHint'),
     showBtn: $('showBtn'), delGroupBtn: $('delGroupBtn'),
     setMax: $('setMax'), setToday: $('setToday'), setSound: $('setSound'), storageInfo: $('storageInfo'), clearAllBtn: $('clearAllBtn'),
+    updateInfo: $('updateInfo'), updateBtn: $('updateBtn'),
     qrOverlay: $('qrOverlay'), qrTitle: $('qrTitle'), qrCanvas: $('qrCanvas'), qrPart: $('qrPart'), qrNames: $('qrNames'), qrClose: $('qrClose'),
     dialog: $('dialog'), dialogText: $('dialogText'), dialogCancel: $('dialogCancel'), dialogOk: $('dialogOk')
   };
@@ -51,6 +52,13 @@
   var cameraWasOn = false;     // まとめ QR の表示 / 画面が隠れた間に止めたカメラを戻すか
   var dialogOnOk = null;
   var dialogOnCancel = null;
+  var swReg = null;            // Service Worker の登録 (更新の確認に使う)
+  var pageLoadedAt = Date.now();
+  var userInteracted = false;  // 開いてから一度でも画面に触れたか
+  var applyingUpdate = false;
+  var manualUpdate = false;    // 設定の「最新版に更新」を押した (見つかったら聞かずに切り替える)
+  var lastUpdateCheck = 0;
+  var updateInfoText = '';
 
   // ── 小物 ──
 
@@ -177,9 +185,7 @@
       b.appendChild(make('span', '', '新しい版があります (読み取ったリストは残ります)'));
       var btn = make('button', '', '更新する');
       btn.type = 'button';
-      btn.addEventListener('click', function () {
-        if (updateWorker) updateWorker.postMessage({ type: 'SKIP_WAITING' });
-      });
+      btn.addEventListener('click', function () { applyUpdate(updateWorker); });
       b.appendChild(btn);
       el.banners.appendChild(b);
     }
@@ -258,6 +264,7 @@
         : persisted === false ? ' (長く使わないとブラウザが消すことがあります。ホーム画面に追加して使ってください)' : '') +
       ' ・合計 ' + totalMembers(state) + ' 名';
     el.clearAllBtn.disabled = totalMembers(state) === 0 && state.groups.length <= 1;
+    el.updateInfo.textContent = 'v' + VERSION + (updateInfoText ? ' — ' + updateInfoText : '');
   }
 
   function render() {
@@ -639,6 +646,7 @@
       return;
     }
     render();   // 別のタブ / 日付の変わり目の表示を取り込む
+    if (Date.now() - lastUpdateCheck > 60000) checkForUpdate(false);   // 裏から戻ったときも新しい版を確かめる
     if (!el.qrOverlay.hidden) requestWakeLock();
     else if (cameraWasOn) {
       cameraWasOn = false;
@@ -650,32 +658,114 @@
     if (e.key === null || e.key === store.KEY) render();
   });
 
-  // ── Service Worker (オフラインで動かす。更新は「更新する」を押したときだけ切り替える) ──
+  // ── Service Worker と更新 ──
+  //
+  // オフラインで動かすために、アプリ一式は Service Worker のキャッシュから返している。新しい版への切り替えは:
+  //   - 開くたび / 画面に戻るたびに、アプリから更新を確かめる (ブラウザ任せにしない。ホーム画面のアプリは裏から戻っただけでは確かめない)
+  //   - 開いた直後でまだ何も操作していなければ、聞かずに切り替える (読み込み直すだけ。リストは localStorage にあるので残る)
+  //   - 作業中に見つかったら上に「新しい版があります」を出し、「更新する」で切り替える
+  //   - 設定の「最新版に更新」は、その場で確かめて、あれば聞かずに切り替える
+
+  var AUTO_APPLY_WINDOW_MS = 15000;   // 開いてからこの時間内 (かつ未操作) なら聞かずに切り替える
+  var APPLY_GUARD_KEY = 'prereception.applyAt';
+
+  ['pointerdown', 'keydown'].forEach(function (type) {
+    document.addEventListener(type, function () { userInteracted = true; }, { capture: true, passive: true });
+  });
+
+  function setUpdateInfo(text) {
+    updateInfoText = text;
+    el.updateInfo.textContent = 'v' + VERSION + (text ? ' — ' + text : '');
+  }
+
+  /** 直前 (30 秒以内) に切り替えを試みたか。切り替えられずに読み込み直しを繰り返すのを防ぐ。 */
+  function recentlyApplied() {
+    try { return Date.now() - Number(sessionStorage.getItem(APPLY_GUARD_KEY) || 0) < 30000; } catch (e) { return false; }
+  }
+
+  function applyUpdate(worker) {
+    if (applyingUpdate || !worker) return;
+    applyingUpdate = true;
+    try { sessionStorage.setItem(APPLY_GUARD_KEY, String(Date.now())); } catch (e) { /* 使えなくても切り替えはする */ }
+    setUpdateInfo('新しい版に切り替えています…');
+    worker.postMessage({ type: 'SKIP_WAITING' });
+    // 切り替わると controllerchange で読み込み直す。合図が届かなかったときのために、少し待ってから読み込み直す
+    setTimeout(function () { window.location.reload(); }, 4000);
+  }
+
+  /** 新しい版の取得が終わった (待機中の Service Worker がある)。 */
+  function onUpdateReady(worker) {
+    updateWorker = worker;
+    var idle = !userInteracted && Date.now() - pageLoadedAt < AUTO_APPLY_WINDOW_MS &&
+      !scanning && el.qrOverlay.hidden && el.dialog.hidden;
+    if (manualUpdate || (idle && !recentlyApplied())) {
+      applyUpdate(worker);
+    } else {
+      setUpdateInfo('新しい版があります');
+      renderBanners();
+    }
+  }
+
+  function watchWorker(worker) {
+    if (!worker) return;
+    worker.addEventListener('statechange', function () {
+      if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+        onUpdateReady(worker);
+      } else if (worker.state === 'redundant' && manualUpdate && !applyingUpdate) {
+        manualUpdate = false;
+        setUpdateInfo('新しい版を取得できませんでした (回線を確認してください)。今の版のまま使えます');
+      }
+    });
+  }
+
+  /** 更新を確かめる。manual = 設定の「最新版に更新」(あれば聞かずに切り替え、無ければ「最新の版です」と出す)。 */
+  function checkForUpdate(manual) {
+    if (!swReg) {
+      if (manual) window.location.reload();   // Service Worker の無い環境は読み込み直すだけ
+      return;
+    }
+    if (manual) {
+      manualUpdate = true;
+      setUpdateInfo('確認しています…');
+      var ready = updateWorker || swReg.waiting;
+      if (ready) { applyUpdate(ready); return; }
+    }
+    lastUpdateCheck = Date.now();
+    swReg.update().then(function () {
+      if (swReg.installing) {            // 続きは watchWorker の statechange で
+        if (manual) setUpdateInfo('新しい版を取得しています…');
+        return;
+      }
+      if (swReg.waiting && navigator.serviceWorker.controller) { onUpdateReady(swReg.waiting); return; }
+      if (manual) {
+        manualUpdate = false;
+        setUpdateInfo('最新の版です');
+      }
+    }).catch(function () {
+      if (manual) {
+        manualUpdate = false;
+        setUpdateInfo('確認できませんでした (回線を確認してください)。今の版のまま使えます');
+      }
+    });
+  }
+
+  el.updateBtn.addEventListener('click', function () { checkForUpdate(true); });
 
   if ('serviceWorker' in navigator) {
     var reloading = false;
     var hadController = !!navigator.serviceWorker.controller;   // 初回の登録 (まだ制御されていない) では読み込み直さない
     navigator.serviceWorker.addEventListener('controllerchange', function () {
-      if (reloading || !hadController) return;
+      if (reloading || (!hadController && !applyingUpdate)) return;
       reloading = true;
       window.location.reload();   // リストは localStorage にあるので、読み込み直しても残る
     });
-    navigator.serviceWorker.register('sw.js').then(function (reg) {
-      function watch(worker) {
-        if (!worker) return;
-        worker.addEventListener('statechange', function () {
-          if (worker.state === 'installed' && navigator.serviceWorker.controller) {
-            updateWorker = worker;
-            renderBanners();
-          }
-        });
-      }
-      if (reg.waiting && navigator.serviceWorker.controller) {
-        updateWorker = reg.waiting;
-        renderBanners();
-      }
-      watch(reg.installing);
-      reg.addEventListener('updatefound', function () { watch(reg.installing); });
+    // updateViaCache 'none': 更新の確認で HTTP キャッシュを使わない (公開先は 10 分のキャッシュを返す)
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(function (reg) {
+      swReg = reg;
+      reg.addEventListener('updatefound', function () { watchWorker(reg.installing); });
+      watchWorker(reg.installing);
+      if (reg.waiting && navigator.serviceWorker.controller) onUpdateReady(reg.waiting);
+      else if (navigator.serviceWorker.controller) checkForUpdate(false);
     }).catch(function () { /* Service Worker なしでも動く (オフラインでは開けないだけ) */ });
   }
 

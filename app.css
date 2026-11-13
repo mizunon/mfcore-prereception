@@ -179,6 +179,8 @@ button.big { min-height: 56px; font-size: 18px; }
   border-top: 1px solid var(--line);
 }
 .setting input[type="checkbox"] { width: 26px; height: 26px; flex: none; }
+.setting button { flex: none; }
+#updateInfo { color: var(--sub); font-size: 14px; overflow-wrap: anywhere; }
 .note { color: var(--sub); font-size: 13px; line-height: 1.5; }
 #clearAllBtn { width: 100%; }
 

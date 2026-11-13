@@ -1,12 +1,17 @@
 /*
  * 事前受付: オフラインで動かすための Service Worker。
  * アプリ一式を版ごとのキャッシュに入れ、以後はキャッシュから返す (回線が無くても開ける)。
- * 新しい版は入れて待機し、ページの「更新する」が押されたときだけ切り替える (読取の途中で勝手に入れ替えない)。
+ * 新しい版は入れて待機し、ページからの合図 (SKIP_WAITING) で切り替える。
  * 読み取ったリストは localStorage にあり、このキャッシュとは無関係 (版を上げても消えない)。
+ *
+ * 版はこのファイルに直接書く (version.js と同じ値。test/run_node.js が一致を検査する)。
+ * ブラウザは「このファイルのバイト列が変わったか」で更新を見つける。版を version.js だけに置いて
+ * importScripts で読むと、このファイルは変わらないので、読み込んだファイルの HTTP キャッシュ
+ * (公開先は 10 分) が切れるまで更新が見つからない (v1.0.1 で iPhone が更新されなかった)。
  */
-importScripts('version.js');
+var VERSION = '1.0.2';
 
-var CACHE = 'prereception-' + self.APP_VERSION;
+var CACHE = 'prereception-' + VERSION;
 var ASSETS = [
   './',
   'index.html',
